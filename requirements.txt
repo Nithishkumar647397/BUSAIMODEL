@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+numpy
+lapx
+fastapi
+uvicorn[standard]
+websockets

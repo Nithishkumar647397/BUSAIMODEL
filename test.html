@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartBus TN - Live Test Monitor</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    body {
+      background-color: #0f1117;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 30px 20px;
+      min-height: 100vh;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 25px;
+    }
+    .header h1 {
+      font-size: 26px;
+      font-weight: 700;
+      color: #38bdf8;
+      letter-spacing: 0.5px;
+    }
+    .header p {
+      font-size: 14px;
+      color: #94a3b8;
+      margin-top: 5px;
+    }
+    .container {
+      width: 100%;
+      max-width: 640px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    /* Main Status Display Box */
+    .status-box {
+      border-radius: 16px;
+      padding: 30px 20px;
+      text-align: center;
+      transition: background-color 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+      border: 2px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      position: relative;
+    }
+    .status-GREEN {
+      background: linear-gradient(135deg, #064e3b, #047857);
+      border-color: #10b981;
+      box-shadow: 0 0 25px rgba(16, 185, 129, 0.3);
+    }
+    .status-YELLOW {
+      background: linear-gradient(135deg, #78350f, #b45309);
+      border-color: #f59e0b;
+      box-shadow: 0 0 25px rgba(245, 158, 11, 0.3);
+    }
+    .status-RED {
+      background: linear-gradient(135deg, #7f1d1d, #b91c1c);
+      border-color: #ef4444;
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.3);
+    }
+    .status-OVERFLOW {
+      background: linear-gradient(135deg, #581c87, #7e22ce);
+      border-color: #a855f7;
+      box-shadow: 0 0 25px rgba(168, 85, 247, 0.3);
+    }
+    .status-OFFLINE {
+      background: linear-gradient(135deg, #1e293b, #334155);
+      border-color: #64748b;
+      box-shadow: 0 0 20px rgba(100, 116, 139, 0.2);
+    }
+
+    .offline-alert {
+      display: none;
+      background-color: #ef4444;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      margin-bottom: 12px;
+      display: inline-block;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(0.98); }
+    }
+
+    .occupancy-title {
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: rgba(255, 255, 255, 0.8);
+      margin-bottom: 8px;
+    }
+    .occupancy-numbers {
+      font-size: 56px;
+      font-weight: 800;
+      color: #ffffff;
+      line-height: 1;
+    }
+    .status-label {
+      font-size: 20px;
+      font-weight: 700;
+      margin-top: 10px;
+      color: #ffffff;
+      text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    }
+
+    /* Metrics Row */
+    .metrics-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 15px;
+    }
+    .metric-card {
+      background-color: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+    }
+    .metric-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .metric-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+
+    /* Raw JSON Panel */
+    .json-panel {
+      background-color: #090d16;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .json-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .json-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #38bdf8;
+      text-transform: uppercase;
+    }
+    .ws-status {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .ws-connected {
+      background-color: #064e3b;
+      color: #34d399;
+    }
+    .ws-disconnected {
+      background-color: #7f1d1d;
+      color: #f87171;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12.5px;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-break: break-all;
+      background: #040711;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>SmartBus TN &bull; Stage 2 Monitor</h1>
+    <p>Real-time passenger broadcast via WebSocket</p>
+  </div>
+
+  <div class="container">
+    <!-- Big Coloured Occupancy Box -->
+    <div id="statusBox" class="status-box status-OFFLINE">
+      <div id="cameraAlert" class="offline-alert">Camera offline</div>
+      <div class="occupancy-title">Passengers on Board</div>
+      <div class="occupancy-numbers"><span id="occVal">0</span> / <span id="capVal">10</span></div>
+      <div id="statusLabel" class="status-label">INITIALIZING (0%)</div>
+    </div>
+
+    <!-- Directional Counts -->
+    <div class="metrics-row">
+      <div class="metric-card">
+        <div class="metric-title">Boarded (IN)</div>
+        <div id="boardedVal" class="metric-value">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Alighted (OUT)</div>
+        <div id="alightedVal" class="metric-value">0</div>
+      </div>
+    </div>
+
+    <!-- Live JSON Contract -->
+    <div class="json-panel">
+      <div class="json-header">
+        <span class="json-title">Live WebSocket JSON Payload</span>
+        <span id="wsBadge" class="ws-status ws-disconnected">Connecting...</span>
+      </div>
+      <pre id="jsonContent">{ "waiting_for_connection": true }</pre>
+    </div>
+  </div>
+
+  <script>
+    const statusBox = document.getElementById('statusBox');
+    const cameraAlert = document.getElementById('cameraAlert');
+    const occVal = document.getElementById('occVal');
+    const capVal = document.getElementById('capVal');
+    const statusLabel = document.getElementById('statusLabel');
+    const boardedVal = document.getElementById('boardedVal');
+    const alightedVal = document.getElementById('alightedVal');
+    const jsonContent = document.getElementById('jsonContent');
+    const wsBadge = document.getElementById('wsBadge');
+
+    let socket = null;
+
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        wsBadge.textContent = 'Connected';
+        wsBadge.className = 'ws-status ws-connected';
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          jsonContent.textContent = JSON.stringify(data, null, 2);
+
+          // Update metrics
+          occVal.textContent = data.occupancy !== undefined ? data.occupancy : 0;
+          capVal.textContent = data.capacity !== undefined ? data.capacity : 10;
+          boardedVal.textContent = data.boarded !== undefined ? data.boarded : 0;
+          alightedVal.textContent = data.alighted !== undefined ? data.alighted : 0;
+
+          // Camera status
+          const isCamOk = !!data.camera_ok;
+          cameraAlert.style.display = isCamOk ? 'none' : 'inline-block';
+
+          // Status and Color
+          const status = data.status || 'GREEN';
+          const percent = data.percent !== undefined ? data.percent : 0;
+
+          statusBox.className = 'status-box ' + (isCamOk ? `status-${status}` : 'status-OFFLINE');
+          statusLabel.textContent = `${status} (${percent}%)`;
+        } catch (e) {
+          console.error('Error parsing message:', e);
+        }
+      };
+
+      socket.onclose = () => {
+        wsBadge.textContent = 'Disconnected';
+        wsBadge.className = 'ws-status ws-disconnected';
+        cameraAlert.style.display = 'inline-block';
+        statusBox.className = 'status-box status-OFFLINE';
+        setTimeout(connectWebSocket, 1500);
+      };
+
+      socket.onerror = (err) => {
+        console.error('WebSocket error:', err);
+        socket.close();
+      };
+    }
+
+    // Connect on page load
+    connectWebSocket();
+  </script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Ultralytics ByteTrack configuration - SmartBus TN Custom Settings
+# Optimized for tracking stability on webcam/CPU to prevent rapid ID switches
+
+tracker_type: bytetrack # (str) Tracker backend: bytetrack
+track_high_thresh: 0.4 # (float) First-stage match threshold
+track_low_thresh: 0.1 # (float) Second-stage threshold for low-score matches
+new_track_thresh: 0.5 # (float) Start a new track if no match >= this; avoids spurious new IDs
+track_buffer: 60 # (int) Frames to keep lost tracks alive; keeps ID alive across pauses/occlusions
+match_thresh: 0.8 # (float) Association similarity threshold (IoU/cost)
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching

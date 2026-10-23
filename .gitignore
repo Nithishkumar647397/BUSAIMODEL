@@ -1,0 +1,11 @@
+# SmartBus TN - never commit secrets or large files
+ingest_key.txt
+.env
+venv/
+__pycache__/
+*.pt
+*.pyc
+*.pyo
+crossings_log_*.csv
+ground_truth_log_*.csv
+door_lines.json

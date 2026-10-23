@@ -95,7 +95,17 @@ RAW_ID_EXPIRY_FRAMES = 60    # If a raw ID is absent for >60 frames, discard map
 MIN_TRACK_FRAMES = 3         # Minimum frames a stable track must be seen before registering a crossing
 COOLDOWN_FRAMES = 15         # Number of frames to ignore subsequent crossings for the same stable ID (prevents jitter)
 
-# Local Server Broadcasting Settings (Stage 2)
-SEND_TO_SERVER = True        # Transmit telemetry JSON to local FastAPI server
-SERVER_URL = "http://127.0.0.1:8000/update"
 
+# Remote Ingest Server Settings (Stage 3)
+# INGEST_KEY is read exclusively from the environment variable INGEST_KEY.
+# Never hard-code the key in this file.
+# Set it via: set INGEST_KEY=your_key_here  (Windows) or export INGEST_KEY=your_key_here (Linux/Mac)
+# The .bat launchers load it automatically from ingest_key.txt.
+SERVER_BASE = "http://127.0.0.1:8000"  # Change to your friend's server base URL
+
+# Set SEND_EVENTS=True to POST a "board"/"alight" JSON event to {SERVER_BASE}/ingest/event on each counted crossing.
+SEND_EVENTS = True
+
+# Set SEND_FRAMES=True to stream JPEG frames to {SERVER_BASE}/ingest/frame at ≤5 fps.
+# Frames are never saved to disk. Requires SEND_EVENTS=True to be active.
+SEND_FRAMES = False

@@ -31,11 +31,15 @@ import csv
 import json
 import math
 import os
+import queue
+import random
+import string
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from collections import deque
 from datetime import datetime
 
@@ -194,52 +198,289 @@ def log_ground_truth(door: str, direction: str):
 
 
 
-# ------------------------------------------------------------------------------
-# LOCAL BROADCAST TELEMETRY (Stage 2)
-# ------------------------------------------------------------------------------
-server_warned = False
+# ==============================================================================
+# REMOTE INGEST TELEMETRY (Stage 3)
+# ==============================================================================
+# INGEST_KEY is read from the environment variable — never stored in code.
+_INGEST_KEY = os.environ.get("INGEST_KEY", "")
+_key_warned = False
+if not _INGEST_KEY:
+    print("[WARNING] INGEST_KEY environment variable is not set. "
+          "Events and heartbeat will NOT be sent. Set it with:\n"
+          "  Windows: set INGEST_KEY=your_key   (or use run_entrance.bat)\n"
+          "  Linux:   export INGEST_KEY=your_key")
+    _key_warned = True
 
 
-def send_update_to_server_async(boarded: int, alighted: int, occupancy: int, capacity: int):
+def _make_run_id() -> str:
+    """Generates a random 8-character alphanumeric run ID at startup."""
+    return "".join(random.choices(string.ascii_letters + string.digits, k=8))
+
+
+def _http_post(url: str, payload: dict, key: str, timeout: float = 0.5):
     """
-    Transmits current state JSON to the local broadcast server in a background thread.
-    Uses Python's built-in urllib with a 0.5s timeout.
-    Catches errors with one warning, then retries quietly.
+    Posts payload as JSON with X-Ingest-Key header.
+    Returns (status_code, response_dict_or_None).
     """
-    if not getattr(config, "SEND_TO_SERVER", False):
-        return
-
-    status_str, pct = get_status(occupancy, capacity)
-    payload = {
-        "boarded": int(boarded),
-        "alighted": int(alighted),
-        "occupancy": int(occupancy),
-        "capacity": int(capacity),
-        "percent": float(pct),
-        "status": status_str,
-        "camera_ok": True,
-        "timestamp": time.time()
-    }
-
-    def _worker():
-        global server_warned
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Ingest-Key": key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            try:
+                return resp.status, json.loads(body)
+            except Exception:
+                return resp.status, None
+    except urllib.error.HTTPError as e:
+        body = e.read()
         try:
-            url = getattr(config, "SERVER_URL", "http://127.0.0.1:8000/update")
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=0.5) as resp:
-                pass
-            server_warned = False
+            return e.code, json.loads(body)
         except Exception:
-            if not server_warned:
-                print(f"[WARNING] Local broadcast server not reachable at {getattr(config, 'SERVER_URL', 'http://127.0.0.1:8000/update')}. Retrying quietly...")
-                server_warned = True
+            return e.code, None
+    except Exception:
+        return None, None  # network failure
 
-    threading.Thread(target=_worker, daemon=True).start()
+
+class IngestSender:
+    """
+    Background worker that drains an event queue with retry logic.
+    - Retries the same event_id for up to 30 seconds on network failure.
+    - Stops retrying on duplicate / mode_not_ai / overflow replies.
+    - Decrements cumulative_boards or cumulative_alights on mode_not_ai/overflow.
+    - Shows BAD KEY flag on 401; drops on 422.
+    - Also owns the 1-Hz heartbeat thread and the optional frame sender thread.
+    """
+
+    def __init__(self, door: str, run_id: str, cumulative_ref: dict):
+        """
+        cumulative_ref is a shared mutable dict with keys:
+          'boards', 'alights', 'camera_ok', 'fps',
+          'delivered', 'rejected', 'dropped',
+          'server_ok', 'queue_len', 'last_reason', 'bad_key'
+        """
+        self._door = door
+        self._run_id = run_id
+        self._cum = cumulative_ref
+        self._key = _INGEST_KEY
+        self._base = getattr(config, "SERVER_BASE", "http://127.0.0.1:8000")
+        self._send = getattr(config, "SEND_EVENTS", True)
+
+        self._q: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+
+        # Worker thread: drains the event queue
+        self._worker_thread = threading.Thread(
+            target=self._event_loop, daemon=True, name=f"ingest-events-{door}"
+        )
+        self._worker_thread.start()
+
+        # Heartbeat thread: sends 1 Hz heartbeat regardless of events
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name=f"ingest-hb-{door}"
+        )
+        self._hb_thread.start()
+
+        # Optional frame sender thread
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._send_frames = getattr(config, "SEND_FRAMES", False)
+        if self._send_frames:
+            self._frame_thread = threading.Thread(
+                target=self._frame_loop, daemon=True, name=f"ingest-frames-{door}"
+            )
+            self._frame_thread.start()
+
+    def queue_event(self, event_type: str, track_id: int, event_id: str):
+        """Called from the counting loop — never blocks the AI loop."""
+        if not self._send or not self._key:
+            return
+        # Increment cumulative counter when event is queued
+        if event_type == "board":
+            self._cum["boards"] += 1
+        elif event_type == "alight":
+            self._cum["alights"] += 1
+        self._q.put({
+            "event_id": event_id,
+            "door": self._door,
+            "type": event_type,
+            "track_id": track_id,
+            "timestamp": time.time(),
+        })
+        self._cum["queue_len"] = self._q.qsize()
+
+    def push_frame(self, frame_bgr):
+        """Called from the main loop; frame is kept only if frame sender is running."""
+        if not self._send_frames:
+            return
+        with self._frame_lock:
+            self._latest_frame = frame_bgr
+
+    def stop(self):
+        """Signal background threads to stop."""
+        self._stop.set()
+
+    # ------------------------------------------------------------------
+    # Internal: event worker
+    # ------------------------------------------------------------------
+    def _event_loop(self):
+        url = f"{self._base}/ingest/event"
+        while not self._stop.is_set():
+            try:
+                payload = self._q.get(timeout=0.5)
+            except queue.Empty:
+                self._cum["queue_len"] = 0
+                continue
+
+            self._cum["queue_len"] = self._q.qsize()
+            deadline = time.time() + 30.0
+            delay = 0.5
+
+            while time.time() < deadline and not self._stop.is_set():
+                status, resp = _http_post(url, payload, self._key)
+
+                if status is None:
+                    # Network failure — retry with backoff
+                    self._cum["server_ok"] = False
+                    time.sleep(min(delay, deadline - time.time()))
+                    delay = min(delay * 2, 8.0)
+                    continue
+
+                self._cum["server_ok"] = (200 <= status < 300 or status == 401)
+
+                if status == 401:
+                    self._cum["bad_key"] = True
+                    self._cum["last_reason"] = "401 BAD KEY"
+                    # Keep retrying within the 30 s window
+                    time.sleep(min(delay, deadline - time.time()))
+                    delay = min(delay * 2, 8.0)
+                    continue
+
+                if status == 422:
+                    print(f"[INGEST] 422 Unprocessable for event {payload['event_id']} — dropped.")
+                    self._cum["dropped"] += 1
+                    self._cum["last_reason"] = "422 bad payload"
+                    break
+
+                if resp is None:
+                    break
+
+                applied = resp.get("applied", False)
+                reason = resp.get("reason", "")
+                self._cum["bad_key"] = False
+                self._cum["last_reason"] = reason if reason else ("ok" if applied else "?")
+
+                if applied:
+                    # delivered (including warnings alight_at_zero / door_type_mismatch)
+                    self._cum["delivered"] += 1
+                    self._cum["server_ok"] = True
+                    break
+                else:
+                    if reason == "duplicate":
+                        # Already delivered; stop retrying, no change to counter
+                        self._cum["delivered"] += 1
+                        self._cum["server_ok"] = True
+                        break
+                    elif reason in ("mode_not_ai", "overflow"):
+                        # Rejected: decrement matching cumulative counter
+                        self._cum["rejected"] += 1
+                        evt_type = payload.get("type", "")
+                        if evt_type == "board":
+                            self._cum["boards"] = max(0, self._cum["boards"] - 1)
+                        elif evt_type == "alight":
+                            self._cum["alights"] = max(0, self._cum["alights"] - 1)
+                        print(f"[INGEST] Event {payload['event_id']} REJECTED: {reason}. Cumulative adjusted.")
+                        self._cum["server_ok"] = True
+                        break
+                    else:
+                        # Unknown rejection — retry
+                        time.sleep(min(delay, deadline - time.time()))
+                        delay = min(delay * 2, 8.0)
+                        continue
+
+            else:
+                # 30-second deadline expired
+                self._cum["dropped"] += 1
+                self._cum["last_reason"] = "timeout 30s"
+                print(f"[INGEST] Event {payload['event_id']} dropped after 30 s — still counted.")
+
+            self._cum["queue_len"] = self._q.qsize()
+
+    # ------------------------------------------------------------------
+    # Internal: 1-Hz heartbeat
+    # ------------------------------------------------------------------
+    def _heartbeat_loop(self):
+        url = f"{self._base}/ingest/heartbeat"
+        while not self._stop.is_set():
+            payload = {
+                "door": self._door,
+                "run_id": self._run_id,
+                "cumulative_boards": self._cum["boards"],
+                "cumulative_alights": self._cum["alights"],
+                "fps": round(self._cum["fps"], 1),
+                "camera_ok": self._cum["camera_ok"],
+                "timestamp": time.time(),
+            }
+            if self._key:
+                try:
+                    status, resp = _http_post(url, payload, self._key)
+                    if status == 200 and resp:
+                        match = resp.get("match")
+                        if match is not None and not match:
+                            print(f"[INGEST] Heartbeat MISMATCH: server says {resp}")
+                        self._cum["server_ok"] = True
+                        self._cum["bad_key"] = False
+                    elif status == 401:
+                        self._cum["bad_key"] = True
+                        self._cum["server_ok"] = False
+                    elif status is None:
+                        self._cum["server_ok"] = False
+                except Exception:
+                    self._cum["server_ok"] = False
+            self._stop.wait(1.0)
+
+    # ------------------------------------------------------------------
+    # Internal: frame sender (≤5 fps, no disk write)
+    # ------------------------------------------------------------------
+    def _frame_loop(self):
+        url = f"{self._base}/ingest/frame?door={urllib.parse.quote(self._door)}"
+        interval = 1.0 / 5.0  # max 5 fps
+        while not self._stop.is_set():
+            t0 = time.time()
+            if self._key:
+                with self._frame_lock:
+                    frame = self._latest_frame
+                    self._latest_frame = None  # drop if not consumed in time
+                if frame is not None:
+                    try:
+                        small = cv2.resize(frame, (640, 480))
+                        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                        if ok:
+                            jpeg_bytes = buf.tobytes()
+                            req = urllib.request.Request(
+                                url,
+                                data=jpeg_bytes,
+                                headers={
+                                    "Content-Type": "image/jpeg",
+                                    "X-Ingest-Key": self._key,
+                                },
+                                method="POST",
+                            )
+                            try:
+                                urllib.request.urlopen(req, timeout=0.5)
+                            except Exception:
+                                pass  # drop frame silently
+                    except Exception:
+                        pass
+            elapsed = time.time() - t0
+            self._stop.wait(max(0.0, interval - elapsed))
 
 
 # ==============================================================================
@@ -252,7 +493,8 @@ def draw_hud(frame, door: str, door_label: str, count_direction: str,
              raw_ids_created: int, stable_ids_created: int, stitches_done: int,
              rej_too_far: int, rej_size: int, rej_ambig: int, rej_side: int, rej_in_use: int,
              rejected_short: int, rejected_wide: int,
-             gt_in: int, gt_out: int, debug_mode: bool, paused: bool):
+             gt_in: int, gt_out: int, debug_mode: bool, paused: bool,
+             ingest_cum: dict | None = None):
     """
     Renders top status banner, diagnostic metrics, and control prompts onto frame.
     Adjusted per door mode (shows IN for entrance, OUT for exit, and ignored count).
@@ -348,6 +590,24 @@ def draw_hud(frame, door: str, door_label: str, count_direction: str,
 
         rej_text = f"DET REJECTED: short={rejected_short} wide={rejected_wide} (AspectFilter={'ON' if config.USE_ASPECT_FILTER else 'OFF'})"
         cv2.putText(frame, rej_text, (15, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 200, 255), 1)
+
+    # Ingest status bar (always visible, one line above the bottom guide)
+    if ingest_cum is not None and getattr(config, "SEND_EVENTS", True):
+        server_state = "OK" if ingest_cum.get("server_ok") else "DOWN"
+        srv_color = (60, 220, 60) if ingest_cum.get("server_ok") else (40, 40, 230)
+        bad_key = ingest_cum.get("bad_key", False)
+        last_reason = ingest_cum.get("last_reason", "")
+        ingest_text = (
+            f"SRV:{server_state}  Q:{ingest_cum.get('queue_len', 0)} "
+            f"D:{ingest_cum.get('delivered', 0)} "
+            f"REJ:{ingest_cum.get('rejected', 0)} "
+            f"DROP:{ingest_cum.get('dropped', 0)} "
+            f"last:{last_reason}"
+        )
+        cv2.putText(frame, ingest_text, (15, h - 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, srv_color, 1)
+        if bad_key:
+            cv2.putText(frame, "BAD KEY", (w - 110, h - 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.60, (40, 40, 230), 2)
 
     # Bottom Guide Text
     debug_state = "ON" if debug_mode else "OFF"
@@ -599,11 +859,38 @@ def main():
     prev_time = time.time()
     fps = 0.0
     frame_idx = 0
+    last_frame_time = time.time()  # for camera_ok heartbeat field
 
-    # Telemetry broadcast timer
-    last_server_send_time = 0.0
-    send_update_to_server_async(in_total, out_total, occupancy, config.CAPACITY)
+    # ---- Ingest sender setup ----
+    run_id = _make_run_id()
+    # Local event ID counter — starts at 1, never resets between r-resets
+    event_local_counter = [0]  # mutable list so inner function can write
 
+    # Shared mutable state dict read by IngestSender and draw_hud
+    ingest_cum = {
+        "boards": 0,
+        "alights": 0,
+        "fps": 0.0,
+        "camera_ok": True,
+        "delivered": 0,
+        "rejected": 0,
+        "dropped": 0,
+        "server_ok": False,
+        "queue_len": 0,
+        "last_reason": "",
+        "bad_key": False,
+    }
+
+    sender = IngestSender(door, run_id, ingest_cum)
+
+    def queue_event(event_type: str, track_id: int):
+        """Generates a unique event_id and queues it. Called on each counted crossing."""
+        event_local_counter[0] += 1
+        eid = f"{door}-{int(time.time())}-{event_local_counter[0]}"
+        sender.queue_event(event_type, track_id, eid)
+
+    print(f"[INGEST] run_id={run_id} | server={getattr(config, 'SERVER_BASE', '-')} "
+          f"| key={'set' if _INGEST_KEY else 'MISSING'}")
     print("[INFO] Camera stream started. Press 'q' to quit, 't' to toggle H/V line, 'd' for debug overlay.")
     print("-" * 76)
 
@@ -625,10 +912,13 @@ def main():
                 avg_time = sum(frame_times) / max(1, len(frame_times))
                 fps = (1.0 / avg_time) if avg_time > 0 else 0.0
 
-                # Periodic 1-second telemetry broadcast to local server
-                if (curr_time - last_server_send_time) >= 1.0:
-                    send_update_to_server_async(in_total, out_total, occupancy, config.CAPACITY)
-                    last_server_send_time = curr_time
+                # Update shared ingest state for heartbeat
+                last_frame_time = curr_time
+                ingest_cum["fps"] = fps
+                ingest_cum["camera_ok"] = True
+
+                # Push current frame to frame sender (no-op if SEND_FRAMES=False)
+                sender.push_frame(frame)
 
                 # --------------------------------------------------------------
                 # RUN YOLO TRACKING WITH BYTETRACK
@@ -1032,9 +1322,9 @@ def main():
                                     # Write to crossings_log_<door>.csv
                                     log_crossing(door, stable_id, direction, in_total, out_total, occupancy, clamped)
 
-                                    # Immediate telemetry broadcast to local server upon crossing
-                                    send_update_to_server_async(in_total, out_total, occupancy, config.CAPACITY)
-                                    last_server_send_time = time.time()
+                                    # Queue ingest event (board / alight)
+                                    evt_type = "board" if direction == "IN" else "alight"
+                                    queue_event(evt_type, stable_id)
 
                             # Update confirmed side
                             last_confirmed_side[stable_id] = current_side
@@ -1134,7 +1424,8 @@ def main():
                          raw_ids_created, stable_ids_created, stitches_done,
                          rej_too_far, rej_size, rej_ambig, rej_side, rej_in_use,
                          rejected_short, rejected_wide,
-                         gt_in, gt_out, debug_mode, paused)
+                         gt_in, gt_out, debug_mode, paused,
+                         ingest_cum=ingest_cum)
 
             else:
                 # Paused state display
@@ -1144,7 +1435,8 @@ def main():
                          raw_ids_created, stable_ids_created, stitches_done,
                          rej_too_far, rej_size, rej_ambig, rej_side, rej_in_use,
                          rejected_short, rejected_wide,
-                         gt_in, gt_out, debug_mode, paused)
+                         gt_in, gt_out, debug_mode, paused,
+                         ingest_cum=ingest_cum)
 
             # Display main frame with door-specific window title
             cv2.imshow(f"SmartBus TN - AI People Counter ({door_label})", frame)
@@ -1216,11 +1508,9 @@ def main():
                 stable_ids_created = 0
                 stitches_done = 0
                 next_stable_id = 1
+                # NOTE: ingest cumulative_boards/alights are NOT reset — they are session-total
+                # for the heartbeat. Only the local UI counters reset.
                 print("[INFO] All counters, tracking states, and ground-truth tallies reset to 0.")
-
-                # Broadcast reset state immediately to local server
-                send_update_to_server_async(in_total, out_total, occupancy, config.CAPACITY)
-                last_server_send_time = time.time()
             elif key == ord('w'):
                 line_ratio = max(0.10, round(line_ratio - 0.02, 2))
                 direction_label = "UP" if line_orientation == "horizontal" else "LEFT"
@@ -1236,6 +1526,7 @@ def main():
                 print(f"[INFO] System {'PAUSED' if paused else 'RESUMED'}.")
 
     finally:
+        sender.stop()
         cam.release()
         cv2.destroyAllWindows()
         print("[INFO] Camera released and windows closed cleanly.")

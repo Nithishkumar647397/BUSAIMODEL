@@ -32,3 +32,5 @@ timestamp,door,track_id,direction,in_total,out_total,occupancy,clamped
 2026-10-22 12:15:14,exit,37,OUT,0,11,0,True
 2026-10-22 12:24:48,exit,2,OUT,0,1,0,True
 2026-10-22 12:25:15,exit,5,OUT,0,2,0,True
+2026-10-22 12:30:51,exit,67,OUT,0,3,0,True
+2026-10-22 12:31:44,exit,79,OUT,0,4,0,True
